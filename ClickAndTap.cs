@@ -17,6 +17,7 @@ namespace ClickAndTap
         private bool _wasButtonPressed;
         private bool[]? _bufferedButtons;
         private bool _isBindingActive;
+        private bool _suppressContactUntilLift;
 
         public void Consume(IDeviceReport report)
         {
@@ -50,7 +51,7 @@ namespace ClickAndTap
 
         private void HandlePenLift(ITabletReport report)
         {
-            if (_isBindingActive)
+            if (_isBindingActive || _suppressContactUntilLift)
             {
                 EmitReport(report, pressure: 0u, buttons: null);
                 _isBindingActive = false;
@@ -59,7 +60,8 @@ namespace ClickAndTap
             {
                 Emit?.Invoke(report);
             }
-            
+
+            _suppressContactUntilLift = false;
             ClearBufferedState();
         }
 
@@ -78,42 +80,49 @@ namespace ClickAndTap
         private void HandlePenDownState(ITabletReport report, bool isButtonPressed)
         {
             bool isPenTouchDown = !_wasPenDown;
-            
+
             if (isPenTouchDown)
             {
                 HandlePenTouchDown(report, isButtonPressed);
                 return;
             }
 
-            // Handle pen drag
-            if (_isBindingActive)
-            {
-                EmitDragWithBinding(report);
-            }
-            else
-            {
-                Emit?.Invoke(report);
-            }
-
-            // Handle button release during active binding
+            // Stop the binding on button release, and keep suppressing pen pressure
+            // until the pen is lifted so the contact cannot become a left click.
             if (_isBindingActive && _wasButtonPressed && !isButtonPressed)
             {
                 EmitReport(report, pressure: 0u, buttons: null);
                 _isBindingActive = false;
+                _suppressContactUntilLift = true;
                 ClearBufferedState();
+                return;
+            }
+
+            if (_isBindingActive)
+            {
+                EmitDragWithBinding(report);
+            }
+            else if (_suppressContactUntilLift)
+            {
+                EmitReport(report, pressure: 0u, buttons: null);
+            }
+            else
+            {
+                Emit?.Invoke(report);
             }
         }
 
         private void HandlePenTouchDown(ITabletReport report, bool isButtonPressed)
         {
             bool shouldUseBinding = isButtonPressed || _bufferedButtons != null;
-            
+
             if (shouldUseBinding)
             {
                 bool[] buttonsToUse = isButtonPressed ? report.PenButtons : _bufferedButtons!;
                 EmitClickBinding(report, buttonsToUse);
                 _bufferedButtons = (bool[])buttonsToUse.Clone();
                 _isBindingActive = true;
+                _suppressContactUntilLift = true;
             }
             else
             {
@@ -124,7 +133,7 @@ namespace ClickAndTap
         private void EmitClickBinding(ITabletReport report, bool[] buttons)
         {
             bool[] mappedButtons = new bool[report.PenButtons.Length];
-            
+
             // Map physical buttons: first -> right click, second -> middle click
             if (buttons.Length > 0 && buttons[0])
                 mappedButtons[0] = true;
@@ -139,7 +148,7 @@ namespace ClickAndTap
             if (_bufferedButtons == null) return;
 
             bool[] mappedButtons = new bool[report.PenButtons.Length];
-            
+
             if (_bufferedButtons.Length > 0 && _bufferedButtons[0])
                 mappedButtons[0] = true;
             else if (_bufferedButtons.Length > 1 && _bufferedButtons[1])
@@ -156,7 +165,7 @@ namespace ClickAndTap
                 Pressure = pressure,
                 PenButtons = buttons ?? new bool[original.PenButtons.Length]
             };
-            
+
             Emit?.Invoke(report);
         }
 
