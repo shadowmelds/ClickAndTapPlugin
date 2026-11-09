@@ -13,11 +13,17 @@ namespace ClickAndTap
         public PipelinePosition Position => PipelinePosition.PostTransform;
         public event Action<IDeviceReport>? Emit;
 
-        private bool _wasPenDown;
+        private enum PenState
+        {
+            Hover,
+            Contact,
+            BoundContact,
+            SuppressedContact
+        }
+
+        private PenState _state = PenState.Hover;
         private bool _wasButtonPressed;
         private bool[]? _bufferedButtons;
-        private bool _isBindingActive;
-        private bool _suppressContactUntilLift;
 
         public void Consume(IDeviceReport report)
         {
@@ -30,104 +36,94 @@ namespace ClickAndTap
             bool isPenDown = tabletReport.Pressure > 0f;
             bool isButtonPressed = tabletReport.PenButtons.Any(b => b);
 
-            // Handle state transitions
-            if (_wasPenDown && !isPenDown)
+            switch (_state)
             {
-                HandlePenLift(tabletReport);
-            }
-            else if (!isPenDown)
-            {
-                HandleHoverState(tabletReport, isButtonPressed);
-            }
-            else if (isPenDown)
-            {
-                HandlePenDownState(tabletReport, isButtonPressed);
+                case PenState.Hover:
+                    HandleHover(tabletReport, isPenDown, isButtonPressed);
+                    break;
+                case PenState.Contact:
+                    HandleContact(tabletReport, isPenDown);
+                    break;
+                case PenState.BoundContact:
+                    HandleBoundContact(tabletReport, isPenDown, isButtonPressed);
+                    break;
+                case PenState.SuppressedContact:
+                    HandleSuppressedContact(tabletReport, isPenDown);
+                    break;
             }
 
-            // Update state
-            _wasPenDown = isPenDown;
             _wasButtonPressed = isButtonPressed;
         }
 
-        private void HandlePenLift(ITabletReport report)
+        private void HandleHover(ITabletReport report, bool isPenDown, bool isButtonPressed)
         {
-            if (_isBindingActive || _suppressContactUntilLift)
+            if (!isPenDown)
             {
+                if (isButtonPressed != _wasButtonPressed)
+                {
+                    _bufferedButtons = isButtonPressed ? (bool[])report.PenButtons.Clone() : null;
+                }
+
                 EmitReport(report, pressure: 0u, buttons: null);
-                _isBindingActive = false;
-            }
-            else
-            {
-                Emit?.Invoke(report);
-            }
-
-            _suppressContactUntilLift = false;
-            ClearBufferedState();
-        }
-
-        private void HandleHoverState(ITabletReport report, bool isButtonPressed)
-        {
-            // Update buffered buttons on state change
-            if (isButtonPressed != _wasButtonPressed)
-            {
-                _bufferedButtons = isButtonPressed ? (bool[])report.PenButtons.Clone() : null;
-            }
-
-            // Emit position-only report
-            EmitReport(report, pressure: 0u, buttons: null);
-        }
-
-        private void HandlePenDownState(ITabletReport report, bool isButtonPressed)
-        {
-            bool isPenTouchDown = !_wasPenDown;
-
-            if (isPenTouchDown)
-            {
-                HandlePenTouchDown(report, isButtonPressed);
                 return;
             }
 
-            // Stop the binding on button release, and keep suppressing pen pressure
-            // until the pen is lifted so the contact cannot become a left click.
-            if (_isBindingActive && _wasButtonPressed && !isButtonPressed)
-            {
-                EmitReport(report, pressure: 0u, buttons: null);
-                _isBindingActive = false;
-                _suppressContactUntilLift = true;
-                ClearBufferedState();
-                return;
-            }
-
-            if (_isBindingActive)
-            {
-                EmitDragWithBinding(report);
-            }
-            else if (_suppressContactUntilLift)
-            {
-                EmitReport(report, pressure: 0u, buttons: null);
-            }
-            else
-            {
-                Emit?.Invoke(report);
-            }
-        }
-
-        private void HandlePenTouchDown(ITabletReport report, bool isButtonPressed)
-        {
             bool shouldUseBinding = isButtonPressed || _bufferedButtons != null;
-
             if (shouldUseBinding)
             {
                 bool[] buttonsToUse = isButtonPressed ? report.PenButtons : _bufferedButtons!;
                 EmitClickBinding(report, buttonsToUse);
                 _bufferedButtons = (bool[])buttonsToUse.Clone();
-                _isBindingActive = true;
-                _suppressContactUntilLift = true;
+                _state = PenState.BoundContact;
             }
             else
             {
                 Emit?.Invoke(report);
+                _state = PenState.Contact;
             }
+        }
+
+        private void HandleContact(ITabletReport report, bool isPenDown)
+        {
+            if (isPenDown)
+            {
+                Emit?.Invoke(report);
+                return;
+            }
+
+            // A normal contact ends naturally; do not alter its release report.
+            Emit?.Invoke(report);
+            ResetToHover();
+        }
+
+        private void HandleBoundContact(ITabletReport report, bool isPenDown, bool isButtonPressed)
+        {
+            if (!isPenDown)
+            {
+                EmitReport(report, pressure: 0u, buttons: null);
+                ResetToHover();
+                return;
+            }
+
+            if (_wasButtonPressed && !isButtonPressed)
+            {
+                // End the binding but suppress contact until the pen is lifted,
+                // otherwise the remaining pen-down reports can become left-clicks.
+                EmitReport(report, pressure: 0u, buttons: null);
+                _state = PenState.SuppressedContact;
+                ClearBufferedState();
+                return;
+            }
+
+            EmitDragWithBinding(report);
+        }
+
+        private void HandleSuppressedContact(ITabletReport report, bool isPenDown)
+        {
+            // Keep pressure and buttons released until the pen leaves the surface.
+            EmitReport(report, pressure: 0u, buttons: null);
+            if (!isPenDown)
+                ResetToHover();
         }
 
         private void EmitClickBinding(ITabletReport report, bool[] buttons)
@@ -145,7 +141,8 @@ namespace ClickAndTap
 
         private void EmitDragWithBinding(ITabletReport report)
         {
-            if (_bufferedButtons == null) return;
+            if (_bufferedButtons == null)
+                return;
 
             bool[] mappedButtons = new bool[report.PenButtons.Length];
 
@@ -159,14 +156,20 @@ namespace ClickAndTap
 
         private void EmitReport(ITabletReport original, uint pressure, bool[]? buttons)
         {
-            var report = new TabletReport
+            var emittedReport = new TabletReport
             {
                 Position = original.Position,
                 Pressure = pressure,
                 PenButtons = buttons ?? new bool[original.PenButtons.Length]
             };
 
-            Emit?.Invoke(report);
+            Emit?.Invoke(emittedReport);
+        }
+
+        private void ResetToHover()
+        {
+            _state = PenState.Hover;
+            ClearBufferedState();
         }
 
         private void ClearBufferedState()
